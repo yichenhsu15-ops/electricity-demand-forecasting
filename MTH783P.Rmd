@@ -1,0 +1,254 @@
+---
+title: "MTH783P: Time Series Analysis for Business — Final Project"
+subtitle: "Electricity Demand Forecasting in Victoria"
+author: "Yi Hsu | 
+date: "May 2026"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    number_sections: false
+    extra_dependencies: ["float"]
+fontsize: 12pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.pos = "H", fig.align = "center")
+
+library(forecast)
+library(dplyr)
+library(lubridate)
+
+# Load and prepare data
+data <- read.csv("elecDaily.csv")
+data$date       <- as.Date(data$date)
+data$school_day <- ifelse(data$school_day == "Y", 1, 0)
+data$holiday    <- ifelse(data$holiday == "Y", 1, 0)
+
+# Impute missing values using linear interpolation
+data$solar_exposure <- zoo::na.approx(data$solar_exposure, na.rm = FALSE)
+data$rainfall       <- zoo::na.approx(data$rainfall, na.rm = FALSE)
+
+# Train/test split
+train <- data[data$date <= as.Date("2020-06-30"), ]
+test  <- data[data$date >= as.Date("2020-07-01"), ]
+
+# msts object (dual seasonality: weekly=7, annual=365.25)
+train_ts <- msts(train$demand, seasonal.periods = c(7, 365.25),
+                 start = c(2015, 1))
+
+# Day of week factor
+train$dow <- factor(weekdays(train$date),
+                    levels = c("Monday","Tuesday","Wednesday","Thursday",
+                               "Friday","Saturday","Sunday"))
+
+# Fit all three models
+fit_stl   <- stlf(train_ts, h = 98)
+fit_tbats <- tbats(train_ts)
+fc_tbats  <- forecast(fit_tbats, h = 98)
+
+xreg_train <- cbind(max_temp   = train$max_temperature,
+                    max_temp2  = train$max_temperature^2,
+                    holiday    = train$holiday,
+                    school_day = train$school_day)
+fit_arima <- auto.arima(train_ts, xreg = xreg_train,
+                        seasonal = FALSE, stepwise = TRUE)
+
+xreg_test <- cbind(max_temp   = test$max_temperature,
+                   max_temp2  = test$max_temperature^2,
+                   holiday    = test$holiday,
+                   school_day = test$school_day)
+fc_arima <- forecast(fit_arima, xreg = xreg_test, h = 98)
+
+actual        <- test$demand
+fc_stl_mean   <- fit_stl$mean
+fc_tbats_mean <- fc_tbats$mean
+fc_arima_mean <- fc_arima$mean
+
+rmse <- function(a, p) sqrt(mean((a - p)^2))
+mae  <- function(a, p) mean(abs(a - p))
+```
+
+## Abstract
+
+This report analyses daily electricity demand in Victoria, Australia, from January 2015 to October 2020. The training set (up to 30 June 2020) is used to forecast demand for the test period (1 July to 6 October 2020, 98 days). Exploratory analysis reveals strong dual seasonality (weekly and annual), a U-shaped relationship between demand and temperature, and significant reductions in demand on holidays. Three models are fitted and compared: STL+ETS, TBATS, and Regression with ARIMA(2,1,3) errors. TBATS achieves the best test-set performance (RMSE = 8,071 MWh, MAE = 6,660 MWh) and passes the Ljung-Box residual test (p = 0.575). The TBATS forecast captures the weekly cycle and seasonal level well, though it underestimates volatility from weather-driven demand spikes.
+
+---
+
+## 1. Exploratory Data Analysis
+
+The training data (2,008 observations, January 2015 to June 2020) exhibits no clear long-run trend, with mean daily demand of 120,010 MWh. The time plot (Figure 1) reveals strong annual seasonality. Two seasonal patterns are evident: (i) weekly seasonality; and (ii) annual seasonality, with demand peaking in winter (June--August) due to heating, and a secondary peak in summer (December--February) due to cooling. The ACF confirms significant autocorrelation at lags 7 and multiples thereof, and a cyclical pattern at lag ~365, motivating models with dual seasonal components. Demand has a non-linear U-shaped relationship with maximum temperature (minimum around 20--22°C), reflecting heating and cooling needs. The correlation matrix shows holiday (r = -0.254) and solar exposure (r = -0.250) as the strongest linear predictors of demand, while school days show a modest positive association (r = 0.117). RRP exhibits extreme positive skew (max = 4,550 vs median = 68 AUD/MWh). Missing values in solar exposure (n=1) and rainfall (n=3) were imputed using linear interpolation.
+
+```{r fig1-2, fig.cap="Top: Time plot and ACF. Bottom: Demand vs temperature and by day of week.", fig.width=6.5, fig.height=4.2}
+par(mfrow = c(2, 2), mar = c(3, 4, 1.5, 1))
+
+# Figure 1: time plot and ACF
+plot(train$date, train$demand, type = "l",
+     main = "Daily Demand (2015-2020)",
+     xlab = "", ylab = "Demand (MWh)")
+acf(train$demand, lag.max = 365, main = "ACF of Daily Demand")
+
+# Figure 2: temperature and day of week
+plot(train$max_temperature, train$demand,
+     col = rgb(0, 0, 0, 0.2), pch = 16,
+     main = "Demand vs Max Temperature",
+     xlab = "Max Temp (C)", ylab = "Demand (MWh)")
+temp_seq   <- seq(min(train$max_temperature), max(train$max_temperature), 0.5)
+smooth_fit <- loess(demand ~ max_temperature, data = train)
+lines(temp_seq, predict(smooth_fit, data.frame(max_temperature = temp_seq)),
+      col = "blue", lwd = 2)
+boxplot(demand ~ dow, data = train,
+        main = "Demand by Day of Week",
+        xlab = "", ylab = "Demand (MWh)", las = 2, cex.axis = 0.6)
+
+par(mfrow = c(1, 1))
+```
+
+## 2. Modelling and Forecasting
+
+**Model 1: STL+ETS.** STL decomposes the series into trend, seasonal, and remainder, with ETS on the seasonally adjusted series. Flexible but cannot include external regressors.
+
+**Model 2: TBATS.** Models multiple seasonal periods via Fourier terms with exponential smoothing, automatically selecting harmonics and Box-Cox transformation.
+
+**Model 3: Regression with ARIMA(2,1,3) errors.** Max temperature entered as linear and quadratic terms (capturing the U-shape), with holiday and school_day indicators. `auto.arima()` selected ARIMA(2,1,3) errors. Holiday reduces demand by ~9,192 MWh; school days increase it by ~1,218 MWh; minimum demand at ~22°C.
+
+TBATS achieved the lowest test-set error on both metrics (Table 1) and was selected as the best model. The regression model underperforms despite strong training-set fit (RMSE = 7,553 MWh), likely due to COVID-19 disruptions in mid-2020 altering demand in ways not captured by the regressors.
+
+| Model | Test RMSE (MWh) | Test MAE (MWh) |
+|:---|---:|---:|
+| STL+ETS | 9,527 | 7,753 |
+| **TBATS** | **8,071** | **6,660** |
+| Regression + ARIMA(2,1,3) errors | 14,298 | 11,493 |
+
+Table: Test set forecast accuracy
+
+The Ljung-Box test on TBATS residuals gives Q* = 396.01 (df = 402), p = 0.575 (Figure 2), indicating no significant remaining autocorrelation. Residuals show zero mean, approximately constant variance, and near-normality with slightly heavy tails — the white noise assumption is satisfied. The TBATS forecast (Figure 3) tracks the weekly cycle and seasonal decline well, but underestimates August spikes. A potential improvement is combining TBATS with external regressors (temperature, holidays) via MSTL errors.
+
+```{r fig3, fig.cap="Residual diagnostics for TBATS", fig.width=6.5, fig.height=2.1, results='hide'}
+checkresiduals(fit_tbats)
+```
+
+```{r fig4, fig.cap="TBATS forecast vs actual demand (test period)", fig.width=6.5, fig.height=2.1}
+par(mar = c(3.5, 4, 1.5, 1))
+test_dates <- test$date
+plot(test_dates, actual, type = "l", col = "red",
+     main = "TBATS Forecast vs Actual (Test Period)",
+     ylab = "Demand (MWh)", xlab = "Date",
+     ylim = c(90000, 160000))
+lines(test_dates, as.numeric(fc_tbats_mean), col = "blue")
+legend("topleft", legend = c("Actual", "Forecast"),
+       col = c("red", "blue"), lty = 1)
+```
+
+\newpage
+
+## 3. R Code
+
+```{r code-all, echo=TRUE, eval=FALSE}
+library(forecast)
+library(dplyr)
+library(lubridate)
+
+# Load and prepare data
+data <- read.csv("elecDaily.csv")
+data$date       <- as.Date(data$date)
+data$school_day <- ifelse(data$school_day == "Y", 1, 0)
+data$holiday    <- ifelse(data$holiday == "Y", 1, 0)
+
+# Impute missing values using linear interpolation
+data$solar_exposure <- zoo::na.approx(data$solar_exposure, na.rm = FALSE)
+data$rainfall       <- zoo::na.approx(data$rainfall, na.rm = FALSE)
+
+# Train/test split
+train <- data[data$date <= as.Date("2020-06-30"), ]
+test  <- data[data$date >= as.Date("2020-07-01"), ]
+
+# msts object (dual seasonality: weekly=7, annual=365.25)
+train_ts <- msts(train$demand, seasonal.periods = c(7, 365.25),
+                 start = c(2015, 1))
+
+train$dow <- factor(weekdays(train$date),
+                    levels = c("Monday","Tuesday","Wednesday","Thursday",
+                               "Friday","Saturday","Sunday"))
+
+# Summary statistics
+summary(train[, c("demand","RRP","min_temperature","max_temperature",
+                  "solar_exposure","rainfall")])
+
+# Correlation matrix
+round(cor(train[, c("demand","max_temperature","min_temperature",
+                    "RRP","solar_exposure","rainfall","holiday","school_day")],
+          use = "complete.obs"), 3)
+
+# Figure 1: all four EDA plots in a 2x2 grid
+par(mfrow = c(2, 2), mar = c(3, 4, 1.5, 1))
+plot(train$date, train$demand, type = "l",
+     main = "Daily Demand (2015-2020)",
+     xlab = "", ylab = "Demand (MWh)")
+acf(train$demand, lag.max = 365, main = "ACF of Daily Demand")
+plot(train$max_temperature, train$demand,
+     col = rgb(0, 0, 0, 0.2), pch = 16,
+     main = "Demand vs Max Temperature",
+     xlab = "Max Temp (C)", ylab = "Demand (MWh)")
+temp_seq   <- seq(min(train$max_temperature), max(train$max_temperature), 0.5)
+smooth_fit <- loess(demand ~ max_temperature, data = train)
+lines(temp_seq, predict(smooth_fit, data.frame(max_temperature = temp_seq)),
+      col = "blue", lwd = 2)
+boxplot(demand ~ dow, data = train,
+        main = "Demand by Day of Week",
+        xlab = "", ylab = "Demand (MWh)", las = 2, cex.axis = 0.6)
+par(mfrow = c(1, 1))
+
+# Model 1: STL + ETS
+fit_stl <- stlf(train_ts, h = 98)
+
+# Model 2: TBATS
+fit_tbats <- tbats(train_ts)
+fc_tbats  <- forecast(fit_tbats, h = 98)
+
+# Model 3: Regression with ARIMA errors
+xreg_train <- cbind(max_temp   = train$max_temperature,
+                    max_temp2  = train$max_temperature^2,
+                    holiday    = train$holiday,
+                    school_day = train$school_day)
+fit_arima <- auto.arima(train_ts, xreg = xreg_train,
+                        seasonal = FALSE, stepwise = TRUE)
+summary(fit_arima)
+
+xreg_test <- cbind(max_temp   = test$max_temperature,
+                   max_temp2  = test$max_temperature^2,
+                   holiday    = test$holiday,
+                   school_day = test$school_day)
+fc_arima <- forecast(fit_arima, xreg = xreg_test, h = 98)
+
+# Accuracy metrics
+actual        <- test$demand
+fc_stl_mean   <- fit_stl$mean
+fc_tbats_mean <- fc_tbats$mean
+fc_arima_mean <- fc_arima$mean
+
+rmse <- function(a, p) sqrt(mean((a - p)^2))
+mae  <- function(a, p) mean(abs(a - p))
+
+cat("STL+ETS: RMSE =", round(rmse(actual, fc_stl_mean), 1),
+    " MAE =", round(mae(actual, fc_stl_mean), 1), "\n")
+cat("TBATS:   RMSE =", round(rmse(actual, fc_tbats_mean), 1),
+    " MAE =", round(mae(actual, fc_tbats_mean), 1), "\n")
+cat("ARIMA:   RMSE =", round(rmse(actual, fc_arima_mean), 1),
+    " MAE =", round(mae(actual, fc_arima_mean), 1), "\n")
+
+# Residual diagnostics for best model (TBATS)
+checkresiduals(fit_tbats)
+
+# Forecast vs actual (test period)
+par(mar = c(3.5, 4, 1.5, 1))
+test_dates <- test$date
+plot(test_dates, actual, type = "l", col = "red",
+     main = "TBATS Forecast vs Actual (Test Period)",
+     ylab = "Demand (MWh)", xlab = "Date",
+     ylim = c(90000, 160000))
+lines(test_dates, as.numeric(fc_tbats_mean), col = "blue")
+legend("topleft", legend = c("Actual", "Forecast"),
+       col = c("red", "blue"), lty = 1)
+```
